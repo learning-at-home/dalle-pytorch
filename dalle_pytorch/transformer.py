@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from functools import partial
 from itertools import islice, cycle
 
@@ -21,9 +22,7 @@ def default(val, d):
     return val if exists(val) else d
 
 def cast_tuple(val, depth = 1):
-    if isinstance(val, list):
-        val = tuple(val)
-    return val if isinstance(val, tuple) else (val,) * depth
+    return val if isinstance(val, Iterable) else (val,) * depth
 
 # classes
 
@@ -150,7 +149,9 @@ class Transformer(nn.Module):
         stable = False,
         sandwich_norm = False,
         shift_tokens = False,
-        rotary_emb = True
+        rotary_emb = True,
+        shared_attn_ids = None,
+        shared_ff_ids = None,
     ):
         super().__init__()
         layers = nn.ModuleList([])
@@ -160,7 +161,13 @@ class Transformer(nn.Module):
         attn_types = cast_tuple(attn_types)
         attn_type_layer = islice(cycle(attn_types), depth)
 
-        for ind, sparse_attn, attn_type in zip(range(depth), sparse_layer, attn_type_layer):
+        shared_attn_ids = cycle(default(shared_attn_ids, range(depth)))
+        shared_ff_ids = cycle(default(shared_ff_ids, range(depth)))
+        shared_attn_layers = {}
+        shared_ff_layers = {}
+
+        for (ind, sparse_attn, attn_type, attn_id, ff_id) in \
+                zip(range(depth), sparse_layer, attn_type_layer, shared_attn_ids, shared_ff_ids):
             if attn_type == 'full':
                 attn_class = partial(Attention, stable = stable)
             elif attn_type == 'sparse':
@@ -176,12 +183,21 @@ class Transformer(nn.Module):
             else:
                 raise ValueError(f'attention type "{attn_type}" is not valid')
 
-            if attn_type != 'mlp':
-                attn = attn_class(dim, causal = causal, seq_len = seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout)
-            else:
-                attn = attn_class(dim = dim, causal = causal, dim_ff = dim * 4)
+            attn, reused_attn_type = shared_attn_layers.get(attn_id, (None, None))
+            if not exists(attn):
+                if attn_type != 'mlp':
+                    attn = attn_class(dim, causal = causal, seq_len = seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout)
+                else:
+                    attn = attn_class(dim = dim, causal = causal, dim_ff = dim * 4)
+                shared_attn_layers[attn_id] = (attn, attn_type)
+            elif attn_type != reused_attn_type:
+                raise ValueError('attn_types do not match shared_attn_ids '
+                                 f'(ind = {ind}, attn_type = "{attn_type}", reused_attn_type = "{reused_attn_type}")')
 
-            ff = FeedForward(dim, mult = ff_mult, dropout = ff_dropout)
+            ff = shared_ff_layers.get(ff_id)
+            if not exists(ff):
+                ff = FeedForward(dim, mult = ff_mult, dropout = ff_dropout)
+                shared_ff_layers[ff_id] = ff
 
             if shift_tokens:
                 attn, ff = map(lambda t: PreShiftToken(t, image_size = image_fmap_size, seq_len = seq_len), (attn, ff))
