@@ -344,6 +344,7 @@ class DALLE(nn.Module):
         shared_attn_ids = None,
         shared_ff_ids = None,
         share_input_output_emb = False,
+        optimize_for_inference = False,
     ):
         super().__init__()
         assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE)), 'vae must be an instance of DiscreteVAE'
@@ -391,6 +392,7 @@ class DALLE(nn.Module):
             rotary_emb = rotary_emb,
             shared_attn_ids = shared_attn_ids,
             shared_ff_ids = shared_ff_ids,
+            optimize_for_inference = optimize_for_inference,
         )
 
         self.stable = stable
@@ -484,7 +486,8 @@ class DALLE(nn.Module):
         filter_thres = 0.5,
         temperature = 1.,
         img = None,
-        num_init_img_tokens = None
+        num_init_img_tokens = None,
+        use_cache = False,
     ):
         vae, text_seq_len, image_seq_len, num_text_tokens = self.vae, self.text_seq_len, self.image_seq_len, self.num_text_tokens
         total_len = text_seq_len + image_seq_len
@@ -503,12 +506,13 @@ class DALLE(nn.Module):
             indices = indices[:, :num_img_tokens]
             out = torch.cat((out, indices), dim = -1)
 
+        cache = {} if use_cache else None
         for cur_len in range(out.shape[1], total_len):
             is_image = cur_len >= text_seq_len
 
             text, image = out[:, :text_seq_len], out[:, text_seq_len:]
 
-            logits = self(text, image, mask = mask)[:, -1, :]
+            logits = self(text, image, mask = mask, cache = cache)[:, -1, :]
 
             filtered_logits = top_k(logits, thres = filter_thres)
             probs = F.softmax(filtered_logits / temperature, dim = -1)
@@ -536,6 +540,7 @@ class DALLE(nn.Module):
         text,
         image = None,
         mask = None,
+        cache = None,
         return_loss = False
     ):
         assert text.shape[-1] == self.text_seq_len, f'the length {text.shape[-1]} of the text tokens you passed in does not have the correct length ({self.text_seq_len})'
@@ -584,7 +589,9 @@ class DALLE(nn.Module):
             alpha = 0.1
             tokens = tokens * alpha + tokens.detach() * (1 - alpha)
 
-        out = self.transformer(tokens)
+        if exists(cache) and cache.get('offset'):
+            tokens = tokens[:, -1:]
+        out = self.transformer(tokens, cache=cache)
 
         if self.stable:
             out = self.norm_by_max(out)
@@ -594,8 +601,13 @@ class DALLE(nn.Module):
         # mask logits to make sure text predicts text (except last token), and image predicts image
 
         logits_mask = self.logits_mask[:, :seq_len]
+        if exists(cache) and cache.get('offset'):
+            logits_mask = logits_mask[:, -1:]
         max_neg_value = -torch.finfo(logits.dtype).max
         logits.masked_fill_(logits_mask, max_neg_value)
+
+        if exists(cache):
+            cache['offset'] = cache.get('offset', 0) + logits.shape[1]
 
         if not return_loss:
             return logits
